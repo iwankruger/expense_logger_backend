@@ -1,0 +1,457 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  expense_log_backend
+
+  Sample SAM Template for expense_log_backend
+  
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 3
+  # add the following to fix a default Stage from being created  
+  # see post https://github.com/awslabs/serverless-application-model/issues/191#issuecomment-580412747
+  Api:
+    OpenApiVersion: 3.0.1 
+
+Parameters:
+  AppStage:
+    Type: String
+    Default: stage
+  YourEmail:
+    Type: String
+    Default: admin@email.com 
+
+
+Resources:
+  
+  ExpenseUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      AdminCreateUserConfig:
+        # Set to True if only the administrator is allowed to create user profiles. Set to False if users can sign themselves up via an app. 
+        AllowAdminCreateUserOnly: true 
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 6 
+          RequireLowercase: true
+          RequireNumbers: false
+          RequireSymbols: false
+          RequireUppercase: true           
+
+  ExpenseUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      GenerateSecret: false
+      RefreshTokenValidity: 30
+      UserPoolId: !Ref ExpenseUserPool
+      ExplicitAuthFlows:
+        - USER_PASSWORD_AUTH          
+
+  # create a default user    
+  UserPoolUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      DesiredDeliveryMediums:
+        - EMAIL
+      Username: !Ref YourEmail
+      UserPoolId: !Ref ExpenseUserPool 
+
+  TransactionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppStage}-transactions"
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S  
+        - AttributeName: date
+          AttributeType: S                      
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH # HASH key is how your data is partitioned
+        - AttributeName: date # RANGE key is how that data is sorted within a particular HASH key
+          KeyType: RANGE  
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1        
+
+  CategoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppStage}-categories"
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S  
+        - AttributeName: categoryId
+          AttributeType: N                      
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH # HASH key is how your data is partitioned
+        - AttributeName: categoryId # RANGE key is how that data is sorted within a particular HASH key
+          KeyType: RANGE  
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1        
+
+  # add role for API Gateway to access DynamoDB      
+  APIDatabaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: APIDatabaseRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                - "dynamodb:PutItem"
+                - "dynamodb:UpdateItem"
+                - "dynamodb:DeleteItem"
+                - "dynamodb:GetItem"
+                - "dynamodb:Scan"
+                Resource: !GetAtt TransactionTable.Arn  
+              - Effect: Allow
+                Action:
+                - "dynamodb:PutItem"
+                - "dynamodb:UpdateItem"
+                - "dynamodb:DeleteItem"
+                - "dynamodb:GetItem"
+                - "dynamodb:Scan"
+                Resource: !GetAtt CategoryTable.Arn        
+
+  ExpenseApi:
+    Type: AWS::Serverless::Api
+    # DependsOn: TransactionTable
+    Properties:
+      StageName: !Ref AppStage
+      Cors: "'*'"
+      Auth:
+        DefaultAuthorizer: ExpenseAuthorizer
+        Authorizers:
+          ExpenseAuthorizer:
+            UserPoolArn: !GetAtt ExpenseUserPool.Arn
+      DefinitionBody: 
+        swagger: "2.0"
+        info:
+          version: "1.0"
+          title: "expense-stack"
+        basePath: !Ref AppStage
+        schemes:
+        - "https"
+        paths:
+          /lambda-test:
+            get:
+              x-amazon-apigateway-integration:
+                httpMethod: post # As indicated in the docs, x-amazon-apigateway-integration MUST be a POST for lambda integrations
+                type: aws_proxy
+                uri:
+                  !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HelloWorldFunction.Arn}/invocations"
+              responses: {}
+          /transactions:
+            get:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                '200':
+                  description: "200 response"
+              x-amazon-apigateway-integration:
+                credentials: !GetAtt APIDatabaseRole.Arn
+                uri: "arn:aws:apigateway:us-east-1:dynamodb:action/Scan"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: "#set($inputRoot=$input.path('$'))                                                      \n \
+                      [                                                                                                         \n \  
+                        #foreach($elem in $inputRoot.Items){                                                                    \n \
+                          \"userId\":      \"$elem.userId.S\",                                                                  \n \        
+                          \"date\":        \"$elem.date.S\",                                                                    \n \  
+                          \"category\":    \"$elem.category.S\",                                                                \n \
+                          \"categoryId\":  #if($elem.categoryId != \"\") $elem.categoryId.N #else null #end,                    \n \
+                          \"description\": \"$elem.description.S\",                                                             \n \
+                          \"type\":        \"$elem.type.S\",                                                                    \n \
+                          \"expenseAmount\": #if($elem.expenseAmount != \"\") $elem.expenseAmount.N #else null #end,            \n \
+                          \"incomeGrossAmount\": #if($elem.incomeGrossAmount != \"\") $elem.incomeGrossAmount.N #else null #end,\n \
+                          \"taxAmount\": #if($elem.taxAmount != \"\") $elem.taxAmount.N #else null #end,                        \n \
+                          \"uifAmount\": #if($elem.uifAmount != \"\") $elem.uifAmount.N #else null #end,                        \n \
+                          \"otherTaxAmount\": #if($elem.otherTaxAmount != \"\") $elem.otherTaxAmount.N #else null #end,         \n \
+                          \"afterTaxAmount\": #if($elem.afterTaxAmount != \"\") $elem.afterTaxAmount.N #else null #end,         \n \
+                          \"netAmount\": #if($elem.netAmount != \"\") $elem.netAmount.N #else null #end                         \n \
+                        }                                                                                                       \n \       
+                        #if($foreach.hasNext),                                                                                  \n \
+                        #end                                                                                                    \n \   
+                      #end\n]"
+                requestTemplates:     
+                  application/json: !Sub "#set($queryDate = \"\")                                               \n \ 
+                    #if(\"$input.params('dateBegin')\" != \"\" && \"$input.params('dateEnd')\" != \"\")         \n \ 
+                        #set($queryDate = \" AND #date >= :b AND #date <= :c\")                                     \n \
+                    #elseif(\"$input.params('dateBegin')\" != \"\")                                             \n \ 
+                        #set($queryDate = \" AND #date >= :b\")                                                 \n \
+                    #elseif(\"$input.params('dateEnd')\" != \"\")                                               \n \ 
+                        #set($queryDate = \" AND #date <= :c\")                                                 \n \ 
+                    #end                                                                                        \n \ 
+                                                                                                                \n \ 
+                    #if(\"$input.params('type')\" != \"\")                                                      \n \
+                        #set($queryDate = $queryDate + \" AND #type = :d\")                                     \n \
+                    #end                                                                                        \n \
+                                                                                                                \n \         
+                    {                                                                                           \n \ 
+                      \"TableName\": \"${TransactionTable}\",                                                   \n \ 
+                      \"FilterExpression\": \"userId = :a$queryDate\",                                          \n \ 
+                      #if(\"$input.params('dateBegin')\" != \"\"                                                \n \
+                          || \"$input.params('dateEnd')\" != \"\"                                               \n \
+                          || \"$input.params('type')\" != \"\"                                                  \n \
+                      )                                                                                         \n \ 
+                      \"ExpressionAttributeNames\": {                                                           \n \
+                          #if(\"$input.params('dateBegin')\" != \"\" || \"$input.params('dateEnd')\" != \"\")   \n \
+                          \"#date\": \"date\"                                                                   \n \
+                          #end                                                                                  \n \
+                          #if(\"$input.params('type')\" != \"\"                                                 \n \
+                          && (\"$input.params('dateBegin')\" != \"\" || \"$input.params('dateEnd')\" != \"\"))  \n \
+                          , \"#type\": \"type\"                                                                 \n \
+                          #elseif(\"$input.params('type')\" != \"\")                                            \n \
+                          \"#type\": \"type\"                                                                   \n \
+                          #end                                                                                  \n \
+                      },                                                                                        \n \ 
+                      #end                                                                                      \n \ 
+                      \"ExpressionAttributeValues\": {                                                          \n \ 
+                          \":a\":{\"S\":\"$input.params('userId')\"}                                            \n \ 
+                          #if(\"$input.params('dateBegin')\" != \"\" && \"$input.params('dateEnd')\" != \"\")   \n \ 
+                          ,\":b\":{\"S\":\"$input.params('dateBegin')\"}                                        \n \ 
+                          ,\":c\":{\"S\":\"$input.params('dateEnd')\"}                                          \n \ 
+                          #elseif(\"$input.params('dateBegin')\" != \"\")                                       \n \ 
+                          ,\":b\":{\"S\":\"$input.params('dateBegin')\"}                                        \n \ 
+                          #elseif(\"$input.params('dateEnd')\" != \"\")                                         \n \ 
+                          ,\":c\":{\"S\":\"$input.params('dateEnd')\"}                                          \n \ 
+                          #end                                                                                  \n \ 
+                          #if(\"$input.params('type')\" != \"\")                                                \n \
+                          ,\":d\":{\"S\":\"$input.params('type')\"}                                             \n \
+                          #end                                                                                  \n \
+                      }                                                                                         \n \ 
+                    }" 
+                passthroughBehavior: "when_no_templates"
+                httpMethod: "POST"
+                type: "aws" 
+            post:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                '200':
+                  description: "200 response"
+              x-amazon-apigateway-integration:
+                credentials: !GetAtt APIDatabaseRole.Arn
+                uri: "arn:aws:apigateway:us-east-1:dynamodb:action/PutItem"
+                responses:
+                  default:
+                    statusCode: "200"
+                requestTemplates:
+                  application/json: !Sub "{\n    \"TableName\": \"${TransactionTable}\", \
+                    \n \"Item\": { \
+                    \n \"userId\": {\n        \"S\": \"$input.path('$.userId')\"                \n },\
+                    \n \"date\": {\n          \"S\": \"$input.path('$.date')\"                  \n },\
+                    \n \"category\": {\n      \"S\": \"$input.path('$.category')\"              \n },\
+                    \n \"categoryId\": {\n    \"N\": \"$input.path('$.categoryId')\"            \n },\
+                    \n \"description\": {\n   \"S\": \"$input.path('$.description')\"           \n },\
+                    \n \"type\": {\n          \"S\": \"$input.path('$.type')\"                  \n } \
+                    #if(\"$input.path('$.expenseAmount')\" != \"\")                             \n \
+                    \n,\"expenseAmount\": {\n \"N\": \"$input.path('$.expenseAmount')\"         \n } \
+                    #end                                                                        \n \
+                    #if(\"$input.path('$.incomeGrossAmount')\" != \"\")                         \n \
+                    \n,\"incomeGrossAmount\": {\n \"N\": \"$input.path('$.incomeGrossAmount')\" \n } \
+                    #end                                                                        \n \
+                    #if(\"$input.path('$.taxAmount')\" != \"\")                                 \n \
+                    \n,\"taxAmount\": {\n \"N\": \"$input.path('$.taxAmount')\"                 \n } \
+                    #end                                                                        \n \
+                    #if(\"$input.path('$.uifAmount')\" != \"\")                                 \n \
+                    \n,\"uifAmount\": {\n \"N\": \"$input.path('$.uifAmount')\"                 \n } \
+                    #end                                                                        \n \
+                    #if(\"$input.path('$.otherTaxAmount')\" != \"\")                            \n \
+                    \n,\"otherTaxAmount\": {\n \"N\": \"$input.path('$.otherTaxAmount')\"       \n } \
+                    #end                                                                        \n \
+                    #if(\"$input.path('$.afterTaxAmount')\" != \"\")                            \n \
+                    \n,\"afterTaxAmount\": {\n \"N\": \"$input.path('$.afterTaxAmount')\"       \n } \
+                    #end                                                                        \n \
+                    #if(\"$input.path('$.netAmount')\" != \"\")                                 \n \
+                    \n,\"netAmount\": {\n \"N\": \"$input.path('$.netAmount')\"                 \n } \
+                    #end                                                                        \n
+                    \n }\n    \n\n}"
+                passthroughBehavior: "when_no_templates"
+                httpMethod: "POST"
+                type: "aws"   
+          /categories:
+            get:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                '200':
+                  description: "200 response"
+              x-amazon-apigateway-integration:
+                credentials: !GetAtt APIDatabaseRole.Arn
+                uri: "arn:aws:apigateway:us-east-1:dynamodb:action/Scan"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: "#set($inputRoot=$input.path('$'))\n \
+                      [                                                   \n \  
+                        #foreach($elem in $inputRoot.Items){              \n \
+                          \"userId\":      \"$elem.userId.S\",            \n \        
+                          \"date\":        \"$elem.date.S\",              \n \  
+                          \"category\":    \"$elem.category.S\",          \n \
+                          \"categoryId\":  $elem.categoryId.N,            \n \
+                          \"description\": \"$elem.description.S\",       \n \
+                          \"type\":        \"$elem.type.S\",              \n \
+                          \"budget\":      $elem.budget.N                 \n \
+                        }                                                 \n \       
+                        #if($foreach.hasNext),                            \n \
+                        #end                                              \n \   
+                      #end\n]"
+                requestTemplates:
+                  application/json: !Sub "#set($queryDate = \"\")                                               \n \ 
+                                                                                                                \n \ 
+                    #if(\"$input.params('type')\" != \"\")                                                      \n \
+                        #set($queryDate = $queryDate + \" AND #type = :b\")                                     \n \
+                    #end                                                                                        \n \
+                                                                                                                \n \         
+                    {                                                                                           \n \ 
+                      \"TableName\": \"${CategoryTable}\",                                                      \n \ 
+                      \"FilterExpression\": \"userId = :a$queryDate\",                                          \n \ 
+                      #if(\"$input.params('type')\" != \"\")                                                    \n \
+                      \"ExpressionAttributeNames\": {                                                           \n \
+                          #if(\"$input.params('type')\" != \"\")                                                \n \
+                          \"#type\": \"type\"                                                                   \n \
+                          #end                                                                                  \n \
+                      },                                                                                        \n \ 
+                      #end                                                                                      \n \ 
+                      \"ExpressionAttributeValues\": {                                                          \n \ 
+                          \":a\":{\"S\":\"$input.params('userId')\"}                                            \n \ 
+                          #if(\"$input.params('type')\" != \"\")                                                \n \
+                          ,\":b\":{\"S\":\"$input.params('type')\"}                                             \n \
+                          #end                                                                                  \n \
+                      }                                                                                         \n \ 
+                    }"
+                passthroughBehavior: "when_no_templates"
+                httpMethod: "POST"
+                type: "aws" 
+            post:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                '200':
+                  description: "200 response"
+              x-amazon-apigateway-integration:
+                credentials: !GetAtt APIDatabaseRole.Arn
+                uri: "arn:aws:apigateway:us-east-1:dynamodb:action/PutItem"
+                responses:
+                  default:
+                    statusCode: "200"
+                requestTemplates:
+                  application/json: !Sub "{\n    \"TableName\": \"${CategoryTable}\", \
+                    \n \"Item\": { \
+                    \n \"userId\": {\n        \"S\": \"$input.path('$.userId')\"      \n },\
+                    \n \"date\": {\n          \"S\": \"$input.path('$.date')\"        \n },\
+                    \n \"category\": {\n      \"S\": \"$input.path('$.category')\"    \n },\
+                    \n \"categoryId\": {\n    \"N\": \"$input.path('$.categoryId')\"  \n },\
+                    \n \"description\": {\n   \"S\": \"$input.path('$.description')\" \n },\
+                    \n \"type\":        {\n   \"S\": \"$input.path('$.type')\"        \n },\
+                    \n \"budget\": {\n        \"N\": \"$input.path('$.budget')\"      \n } \
+                    \n }\n    \n\n}"
+                passthroughBehavior: "when_no_templates"
+                httpMethod: "POST"
+                type: "aws"
+
+  HelloWorldFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: hello-world/
+      Handler: app.lambdaHandler
+      Runtime: nodejs12.x
+      Events:
+        HelloWorld:
+          Type: Api # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
+          Properties:
+            Path: /hello
+            Method: post
+            RestApiId: !Ref ExpenseApi
+            Auth:
+              Authorizer: ExpenseAuthorizer
+ 
+  
+  # fix aws api gateway invoke lambda function permission issue
+  # https://jun711.github.io/aws/aws-api-gateway-invoke-lambda-function-permission/     
+  # ApiGatewayInvokeLambdaPermission:
+  #   Type: "AWS::Lambda::Permission"
+  #   Properties: 
+  #     Action: lambda:InvokeFunction
+  #     FunctionName: !GetAtt 
+  #       - HelloWorldFunction
+  #       - Arn
+  #     Principal: apigateway.amazonaws.com
+  #     SourceArn: !Join [
+  #       "", [
+  #         "arn:aws:execute-api:", 
+  #         {"Ref": "AWS::Region"}, ":", 
+  #         {"Ref": "AWS::AccountId"}, ":", 
+  #         !Ref ExpenseApi, "/*/*/*"
+  #         ]
+  #       ]    
+  # https://github.com/awslabs/serverless-application-model/issues/704     
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-permission.html
+  # IdentityFunctionLambdaPermission:
+  #   Type: AWS::Lambda::Permission
+  #   Properties:
+  #     Action: lambda:InvokeFunction
+  #     FunctionName:
+  #       Ref: HelloWorldFunction
+  #     Principal: apigateway.amazonaws.com   
+  IdentityFunctionLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt HelloWorldFunction.Arn 
+      Principal: apigateway.amazonaws.com     
+        
+
+       
+
+Outputs:
+  userPool:
+    Description: "User pool ID"
+    Value: !Ref ExpenseUserPool
+  clientId: 
+    Description: "Client id for the user pool"
+    Value: !Ref ExpenseUserPoolClient
+  HelloWorldApi:
+    Description: "API Gateway endpoint URL for Prod stage for Hello World function"
+    Value: !Sub "https://${ExpenseApi}.execute-api.${AWS::Region}.amazonaws.com/${AppStage}/hello/"
+  HelloWorldFunction:
+    Description: "Hello World Lambda Function ARN"
+    Value: !GetAtt HelloWorldFunction.Arn
+  HelloWorldFunctionIamRole:
+    Description: "Implicit IAM Role created for Hello World function"
+    Value: !GetAtt HelloWorldFunctionRole.Arn
+  APIDatabaseRole: 
+    Description: "API Gateway DB integration role"
+    Value: !Ref APIDatabaseRole  
+
